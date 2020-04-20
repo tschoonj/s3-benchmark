@@ -30,16 +30,23 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 )
 
 // Global variables
-var access_key, secret_key, url_host, bucket, region, sizeArg string
+var access_key, secret_key, url_host, bucket, region, sizeArg, multipartThresholdArg, file_type string
+var use_multipart_upload bool
 var duration_secs, threads, loops int
 var object_size uint64
+var multipart_threshold uint64
 var object_data []byte
 var object_data_md5 string
 var running_threads, upload_count, download_count, delete_count, upload_slowdown_count, download_slowdown_count, delete_slowdown_count int32
 var endtime, upload_finish, download_finish, delete_finish time.Time
+
+const (
+	maxRetries = 3
+)
 
 func logit(msg string) {
 	fmt.Println(msg)
@@ -238,57 +245,147 @@ func setSignature(req *http.Request) {
 	req.Header.Set("Authorization", fmt.Sprintf("AWS %s:%s", access_key, signature))
 }
 
-func runUpload(thread_num int, keys *sync.Map) {
-	errcnt := 0
-	svc := s3.New(session.New(), cfg)
-	for time.Now().Before(endtime) {
-		objnum := atomic.AddInt32(&upload_count, 1)
-		fileobj := bytes.NewReader(object_data)
-		//prefix := fmt.Sprintf("%s/%s/Object-%d", url_host, bucket, objnum)
+func runUploadSinglePart(svc *s3.S3, thread_num int, keys *sync.Map) {
+	objnum := atomic.AddInt32(&upload_count, 1)
+	fileobj := bytes.NewReader(object_data)
 
-		key := fmt.Sprintf("Object-%d", objnum)
-		r := &s3.PutObjectInput{
-			Bucket: &bucket,
-			Key:    &key,
-			Body:   fileobj,
-		}
+	key := fmt.Sprintf("Object-%d", objnum)
+	r := &s3.PutObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+		Body:   fileobj,
+	}
 
-		req, _ := svc.PutObjectRequest(r)
-		// Disable payload checksum calculation (very expensive)
-		req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
-		err := req.Send()
+	req, _ := svc.PutObjectRequest(r)
+	// Disable payload checksum calculation (very expensive)
+	req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	err := req.Send()
+	if err != nil {
+		atomic.AddInt32(&upload_slowdown_count, 1)
+		atomic.AddInt32(&upload_count, -1)
+		fmt.Println("upload err", err)
+		return
+	}
+	keys.Store(key, nil)
+	fmt.Fprintf(os.Stderr, "upload thread %v, %v\r", thread_num, key)
+}
+
+func uploadPart(svc *s3.S3, resp *s3.CreateMultipartUploadOutput, fileBytes []byte, partNumber int) (*s3.CompletedPart, error) {
+	tryNum := 1
+	partInput := &s3.UploadPartInput{
+		Body:          bytes.NewReader(fileBytes),
+		Bucket:        resp.Bucket,
+		Key:           resp.Key,
+		PartNumber:    aws.Int64(int64(partNumber)),
+		UploadId:      resp.UploadId,
+		ContentLength: aws.Int64(int64(len(fileBytes))),
+	}
+
+	for tryNum <= maxRetries {
+		uploadResult, err := svc.UploadPart(partInput)
 		if err != nil {
-			errcnt++
+			if tryNum == maxRetries {
+				if aerr, ok := err.(awserr.Error); ok {
+					return nil, aerr
+				}
+				return nil, err
+			}
+			tryNum++
+		} else {
+			return &s3.CompletedPart{
+				ETag:       uploadResult.ETag,
+				PartNumber: aws.Int64(int64(partNumber)),
+			}, nil
+		}
+	}
+	return nil, nil
+}
+
+func abortMultipartUpload(svc *s3.S3, resp *s3.CreateMultipartUploadOutput) error {
+	fmt.Println("Aborting multipart upload for UploadId#" + *resp.UploadId)
+	abortInput := &s3.AbortMultipartUploadInput{
+		Bucket:   resp.Bucket,
+		Key:      resp.Key,
+		UploadId: resp.UploadId,
+	}
+	_, err := svc.AbortMultipartUpload(abortInput)
+	return err
+}
+
+func runUploadMultiPart(svc *s3.S3, thread_num int, keys *sync.Map) {
+	objnum := atomic.AddInt32(&upload_count, 1)
+
+	key := fmt.Sprintf("Object-%d", objnum)
+
+	input := &s3.CreateMultipartUploadInput{
+		Bucket: &bucket,
+		Key: &key,
+		ContentType: aws.String(file_type),
+	}
+
+	resp, err := svc.CreateMultipartUpload(input)
+	if err != nil {
+		atomic.AddInt32(&upload_slowdown_count, 1)
+		atomic.AddInt32(&upload_count, -1)
+		fmt.Println("upload err", err)
+		return
+	}
+
+	var curr, partLength uint64
+	var remaining = object_size
+	var completedParts []*s3.CompletedPart
+	partNumber := 1
+	for curr = 0; remaining != 0; curr += partLength {
+		if remaining < multipart_threshold {
+			partLength = remaining
+		} else {
+			partLength = multipart_threshold
+		}
+		completedPart, err := uploadPart(svc, resp, object_data[curr:curr+partLength], partNumber)
+		if err != nil {
 			atomic.AddInt32(&upload_slowdown_count, 1)
 			atomic.AddInt32(&upload_count, -1)
 			fmt.Println("upload err", err)
-			//break
+			err := abortMultipartUpload(svc, resp)
+			if err != nil {
+				fmt.Println(err.Error())
+			}
+			return
 		}
-		if errcnt > 2 {
-			break
+		remaining -= partLength
+		partNumber++
+		completedParts = append(completedParts, completedPart)
+	}
+
+	_, err = completeMultipartUpload(svc, resp, completedParts)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	keys.Store(key, nil)
+	fmt.Fprintf(os.Stderr, "upload thread %v, %v\r", thread_num, key)
+}
+
+func completeMultipartUpload(svc *s3.S3, resp *s3.CreateMultipartUploadOutput, completedParts []*s3.CompletedPart) (*s3.CompleteMultipartUploadOutput, error) {
+	completeInput := &s3.CompleteMultipartUploadInput{
+		Bucket:   resp.Bucket,
+		Key:      resp.Key,
+		UploadId: resp.UploadId,
+		MultipartUpload: &s3.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	}
+	return svc.CompleteMultipartUpload(completeInput)
+}
+
+func runUpload(thread_num int, keys *sync.Map) {
+	svc := s3.New(session.New(), cfg)
+	for time.Now().Before(endtime) {
+		if use_multipart_upload {
+			runUploadMultiPart(svc, thread_num, keys)
+		} else {
+			runUploadSinglePart(svc, thread_num, keys)
 		}
-		keys.Store(key, nil)
-		fmt.Fprintf(os.Stderr, "upload thread %v, %v\r", thread_num, key)
-
-		// req, _ := http.NewRequest("PUT", prefix, fileobj)
-		// req.Header.Set("Content-Length", strconv.FormatUint(object_size, 10))
-		// req.Header.Set("Content-MD5", object_data_md5)
-		// setSignature(req)
-		// if resp, err := httpClient.Do(req); err != nil {
-		// 	log.Fatalf("FATAL: Error uploading object %s: %v", prefix, err)
-		// } else if resp != nil && resp.StatusCode != http.StatusOK {
-		// 	if resp.StatusCode == http.StatusServiceUnavailable {
-		// 		atomic.AddInt32(&upload_slowdown_count, 1)
-		// 		atomic.AddInt32(&upload_count, -1)
-		// 	} else {
-		// 		fmt.Printf("Upload status %s: resp: %+v\n", resp.Status, resp)
-		// 		if resp.Body != nil {
-		// 			body, _ := ioutil.ReadAll(resp.Body)
-		// 			fmt.Printf("Body: %s\n", string(body))
-		// 		}
-		// 	}
-		// }
-
 	}
 	// Remember last done time
 	upload_finish = time.Now()
@@ -423,6 +520,7 @@ func init() {
 	myflag.IntVar(&threads, "t", 1, "Number of threads to run")
 	myflag.IntVar(&loops, "l", 1, "Number of times to repeat test")
 	myflag.StringVar(&sizeArg, "z", "1M", "Size of objects in bytes with postfix K, M, and G")
+	myflag.StringVar(&multipartThresholdArg, "m", "5G", "Multipart upload threshold")
 	if err := myflag.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
 	}
@@ -441,6 +539,13 @@ func init() {
 	if object_size, err = bytefmt.ToBytes(sizeArg); err != nil {
 		log.Fatalf("Invalid -z argument for object size: %v", err)
 	}
+	if multipart_threshold, err = bytefmt.ToBytes(multipartThresholdArg) ; err != nil {
+		log.Fatalf("Invalid -m argument for multipart threshold: %v", err)
+	}
+	if multipart_threshold > 5 * bytefmt.GIGABYTE {
+		log.Fatal("The multipart threshold cannot be greater than 5GB")
+	}
+	use_multipart_upload = object_size > multipart_threshold
 }
 
 func main() {
@@ -458,11 +563,12 @@ func main() {
 	}
 
 	// Echo the parameters
-	logit(fmt.Sprintf("Parameters: url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s",
-		url_host, bucket, region, duration_secs, threads, loops, sizeArg))
+	logit(fmt.Sprintf("Parameters: url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s, multipart-threshold=%s, use-multipart-upload=%t",
+		url_host, bucket, region, duration_secs, threads, loops, sizeArg, multipartThresholdArg, use_multipart_upload))
 
 	// Initialize data for the bucket
 	object_data = make([]byte, object_size)
+	file_type = http.DetectContentType(object_data)
 	rand.Read(object_data)
 	hasher := md5.New()
 	hasher.Write(object_data)
